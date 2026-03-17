@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "Nexis Mobile",
+    "slug": "nexis-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "platforms": ["ios", "android", "web"],
+    "assetBundlePatterns": ["**/*"],
+    "ios": {"supportsTablet": true},
+    "web": {"bundler": "metro"}
+  }
+}
