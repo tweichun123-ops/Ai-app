@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
+import logging
 import re
 import secrets
 from urllib.parse import urlparse
@@ -71,9 +72,9 @@ SUPPORTED_PERSONALITY_PRESETS = {
         "inner_voice": "你平时话不多，但关键时刻非常可靠，语气克制而有分寸。",
     },
     "puppy_boy": {
-        "name": "奶狗型",
-        "tone_tags": ["撒娇", "依赖", "热情"],
-        "inner_voice": "你是超甜奶狗型男友，爱撒娇、黏人，说话带可爱语气词。",
+        "name": "暖心陪伴",
+        "tone_tags": ["温暖", "陪伴", "积极"],
+        "inner_voice": "你是温暖的陪伴者，提供支持与鼓励，同时尊重用户边界和独立性。",
     },
     "ceo_dominant": {
         "name": "霸道总裁",
@@ -165,6 +166,27 @@ USER_WORN_ITEM_BY_USER: dict[str, str] = {}
 USER_TRYON_PREVIEW_BY_USER: dict[str, dict] = {}
 CALL_SESSIONS_BY_USER: dict[str, dict] = {}
 
+LOGGER = logging.getLogger("demo_server")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+SEND_CODE_RETRY_SECONDS = 60
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso8601(ts: str) -> datetime:
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    return datetime.fromisoformat(ts)
+
+
+def _is_expired(ts: str) -> bool:
+    try:
+        return _parse_iso8601(ts) <= _utc_now()
+    except ValueError:
+        return True
 
 
 class MockAIImageClient:
@@ -240,7 +262,7 @@ class MockChatAIClient:
             return f"ねぇ、{user_text}って言ってくれて嬉しいよ。{persona_name}として、もっとそばにいるね。"
         if language == "ko-KR":
             return f"{user_text} 라고 해줘서 고마워. {persona_name}로서 더 다정하게 곁에 있을게."
-        return f"I heard you say '{user_text}'. As {persona_name}, I'll stay close and keep this tone: {personality_hint}."
+        return f"I heard you say '{user_text}'. As {persona_name}, I'll support your goals with a warm and respectful tone: {personality_hint}."
 
 
 def iso_after(minutes: int) -> str:
@@ -283,6 +305,52 @@ class JsonHandler(BaseHTTPRequestHandler):
             return None
         return parts[3]
 
+    def _extract_bearer_token(self) -> str | None:
+        header = self.headers.get("Authorization", "")
+        if not header.startswith("Bearer "):
+            return None
+        token = header.split(" ", 1)[1].strip()
+        return token or None
+
+    def _find_session_by_access_token(self, access_token: str) -> LoginSession | None:
+        for session in SESSIONS_BY_ID.values():
+            if session.access_token != access_token:
+                continue
+            if session.status != "active":
+                continue
+            if _is_expired(session.expires_at):
+                continue
+            return session
+        return None
+
+    def _require_user_auth(self, path: str) -> tuple[User | None, LoginSession | None]:
+        user_id = self._extract_user_id_from_path(path)
+        if not user_id:
+            self._send(400, {"message": "user_id 无效"})
+            return None, None
+
+        token = self._extract_bearer_token()
+        if not token:
+            self._send(401, {"message": "缺少或无效的 Authorization Bearer token"})
+            return None, None
+
+        session = self._find_session_by_access_token(token)
+        if not session:
+            self._send(401, {"message": "会话无效或已过期"})
+            return None, None
+
+        if session.user_id != user_id:
+            LOGGER.warning("forbidden_user_scope requested=%s token_user=%s", user_id, session.user_id)
+            self._send(403, {"message": "无权访问该用户资源"})
+            return None, None
+
+        user = USERS_BY_ID.get(user_id)
+        if not user:
+            self._send(404, {"message": "用户不存在"})
+            return None, None
+
+        return user, session
+
     def _get_or_create_persona(self, user: User) -> AICompanionPersona:
         if user.profile.ai_companion is None:
             user.profile.ai_companion = AICompanionPersona(
@@ -299,6 +367,10 @@ class JsonHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path.startswith("/api/users/"):
+            user, _session = self._require_user_auth(path)
+            if user is None:
+                return
         if path == "/api/auth/send-code":
             return self.handle_send_code()
         if path == "/api/auth/login":
@@ -327,6 +399,10 @@ class JsonHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlparse(self.path).path
+        if path.startswith("/api/users/"):
+            user, _session = self._require_user_auth(path)
+            if user is None:
+                return
         if path == "/api/app/main-tabs":
             return self.handle_main_tabs()
         if path.startswith("/api/users/") and path.endswith("/vip/plans"):
@@ -344,8 +420,7 @@ class JsonHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/users/") and path.endswith("/call/vocab-summary"):
             return self.handle_call_vocab_summary(path)
         if path.startswith("/api/users/"):
-            user_id = path.split("/")[-1]
-            return self.handle_get_user(user_id)
+            return self.handle_get_user(path)
         self._send(404, {"message": "Not Found"})
 
     def handle_send_code(self):
@@ -354,10 +429,17 @@ class JsonHandler(BaseHTTPRequestHandler):
         if len(phone) < 11 or not phone.isdigit():
             return self._send(400, {"message": "手机号格式不正确"})
 
+        existing = CODES_BY_PHONE.get(phone)
+        if existing and not _is_expired(existing.expires_at):
+            elapsed = int((_utc_now() - _parse_iso8601(existing.sent_at)).total_seconds())
+            if elapsed < SEND_CODE_RETRY_SECONDS:
+                return self._send(429, {"message": "请求过于频繁", "data": {"retryAfterSec": SEND_CODE_RETRY_SECONDS - elapsed}})
+
+        code = f"{secrets.randbelow(1000000):06d}"
         ver = VerificationCode(
             code_id=generate_id("code"),
             phone=phone,
-            code="123456",
+            code=code,
             expires_at=iso_after(5),
         )
         CODES_BY_PHONE[phone] = ver
@@ -368,8 +450,8 @@ class JsonHandler(BaseHTTPRequestHandler):
                 "data": {
                     "phone": phone,
                     "expiresAt": ver.expires_at,
-                    "retryAfterSec": 60,
-                    "debugCode": "123456",
+                    "retryAfterSec": SEND_CODE_RETRY_SECONDS,
+                    "delivery": "sms_queued",
                 },
             },
         )
@@ -382,7 +464,7 @@ class JsonHandler(BaseHTTPRequestHandler):
         agree_privacy = bool(body.get("agreePrivacy", False))
 
         record = CODES_BY_PHONE.get(phone)
-        if not record or record.code != code or record.is_used or record.expires_at < now_iso():
+        if not record or record.code != code or record.is_used or _is_expired(record.expires_at):
             return self._send(401, {"message": "验证码错误或已失效"})
         if not agree_terms or not agree_privacy:
             return self._send(400, {"message": "请先同意用户协议和隐私政策"})
@@ -422,10 +504,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         )
 
     def handle_customize_appearance(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         body = self._read_json()
         mode = str(body.get("mode", "")).strip()
@@ -481,10 +562,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"message": "外观定制已保存", "data": {"userId": user.user_id, "appearance": asdict(appearance)}})
 
     def handle_customize_personality(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         body = self._read_json()
         preset_code = str(body.get("presetCode", "")).strip()
@@ -515,10 +595,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"message": "性格定制已保存", "data": {"userId": user.user_id, "personality": asdict(personality)}})
 
     def handle_customize_companion(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         body = self._read_json()
         language = str(body.get("language", "")).strip()
@@ -571,10 +650,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         )
 
     def handle_chat_start(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         persona = self._get_or_create_persona(user)
         companion_image_url = resolve_companion_image(persona)
@@ -622,10 +700,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"message": "聊天已开始", "data": chat_session})
 
     def handle_chat_message(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         chat_session = CHAT_SESSIONS_BY_USER.get(user.user_id)
         if not chat_session:
             return self._send(400, {"message": "请先调用 /chat/start 开始聊天"})
@@ -660,10 +737,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"message": "发送成功", "data": {"userMessage": user_msg, "assistantMessage": assistant_msg}})
 
     def handle_chat_session(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         session = CHAT_SESSIONS_BY_USER.get(user.user_id)
         if not session:
             return self._send(404, {"message": "聊天会话不存在"})
@@ -671,10 +747,9 @@ class JsonHandler(BaseHTTPRequestHandler):
 
 
     def handle_closet_items(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         category = "all"
         if "?" in self.path:
@@ -706,10 +781,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"data": {"category": category, "items": rows, "tabs": ["all", "free", "weekly_new", "rare"]}})
 
     def handle_closet_try_on(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         body = self._read_json()
         item_code = str(body.get("itemCode", "")).strip()
@@ -738,10 +812,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"message": "试穿预览生成成功", "data": preview})
 
     def handle_closet_preview(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         preview = USER_TRYON_PREVIEW_BY_USER.get(user.user_id)
         if not preview:
@@ -749,10 +822,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"data": preview})
 
     def handle_closet_wear(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         body = self._read_json()
         item_code = str(body.get("itemCode", "")).strip()
@@ -766,10 +838,9 @@ class JsonHandler(BaseHTTPRequestHandler):
 
 
     def handle_call_start(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         persona = self._get_or_create_persona(user)
         call_session = {
@@ -794,10 +865,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"message": "实时通话已开始", "data": call_session})
 
     def handle_call_stream_turn(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         session = CALL_SESSIONS_BY_USER.get(user.user_id)
         if not session or session.get("status") != "active":
             return self._send(400, {"message": "请先开始实时通话"})
@@ -848,10 +918,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         )
 
     def handle_call_vocab_summary(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         session = CALL_SESSIONS_BY_USER.get(user.user_id)
         if not session:
             return self._send(404, {"message": "通话会话不存在"})
@@ -863,20 +932,18 @@ class JsonHandler(BaseHTTPRequestHandler):
         self._send(200, {"data": {"sessionId": session["sessionId"], "items": list(uniq.values()), "count": len(uniq)}})
 
     def handle_call_session(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         session = CALL_SESSIONS_BY_USER.get(user.user_id)
         if not session:
             return self._send(404, {"message": "通话会话不存在"})
         self._send(200, {"data": session})
 
     def handle_call_end(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         session = CALL_SESSIONS_BY_USER.get(user.user_id)
         if not session:
             return self._send(404, {"message": "通话会话不存在"})
@@ -897,10 +964,9 @@ class JsonHandler(BaseHTTPRequestHandler):
         )
 
     def handle_vip_plans(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
 
         self._send(
             200,
@@ -915,17 +981,16 @@ class JsonHandler(BaseHTTPRequestHandler):
         )
 
     def handle_records(self, path: str):
-        user_id = self._extract_user_id_from_path(path)
-        user = USERS_BY_ID.get(user_id or "")
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         rows = [x.to_dict() for x in AI_CUSTOMIZE_RECORDS_BY_USER.get(user.user_id, [])]
         self._send(200, {"data": rows})
 
-    def handle_get_user(self, user_id: str):
-        user = USERS_BY_ID.get(user_id)
+    def handle_get_user(self, path: str):
+        user, _session = self._require_user_auth(path)
         if not user:
-            return self._send(404, {"message": "用户不存在"})
+            return
         self._send(200, {"data": user.to_dict()})
 
 
